@@ -115,46 +115,18 @@ pub enum JsonType {
 /// See docs for individual fields for more info.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Numeric values starting with 0 will be treated as strings.
-    /// E.g. convert `<agent>007</agent>` into `"agent":"007"` or `"agent":7`
-    /// Defaults to `false`.
     pub leading_zero_as_string: bool,
-    /// Prefix XML attribute names with this value to distinguish them from XML elements.
-    /// E.g. set it to `@` for `<x a="Hello!" />` to become `{"x": {"@a":"Hello!"}}`
-    /// or set it to a blank string for `{"x": {"a":"Hello!"}}`
-    /// Defaults to `@`.
     pub xml_attr_prefix: String,
-    /// A property name for XML text nodes.
-    /// E.g. set it to `text` for `<x a="Hello!">Goodbye!</x>` to become `{"x": {"@a":"Hello!", "text":"Goodbye!"}}`
-    /// XML nodes with text only and no attributes or no child elements are converted into JSON properties with the
-    /// name of the element. E.g. `<x>Goodbye!</x>` becomes `{"x":"Goodbye!"}`
-    /// Defaults to `#text`
     pub xml_text_node_prop_name: String,
-    /// Defines how empty elements like `<x />` should be handled.
     pub empty_element_handling: NullValue,
-    /// A map of XML paths with their JsonArray overrides. They take precedence over the document-wide `json_type`
-    /// property. The path syntax is based on xPath: literal element names and attribute names prefixed with `@`.
-    /// The path must start with a leading `/`. It is a bit of an inconvenience to remember about it, but it saves
-    /// an extra `if`-check in the code to improve the performance.
-    /// # Example
-    /// - **XML**: `<a><b c="123">007</b></a>`
-    /// - path for `c`: `/a/b/@c`
-    /// - path for `b` text node (007): `/a/b`
     #[cfg(feature = "json_types")]
     pub json_type_overrides: HashMap<String, JsonArray>,
-    /// A list of pairs of regex and JsonArray overrides. They take precedence over both the document-wide `json_type`
-    /// property and the `json_type_overrides` property. The path syntax is based on xPath just like `json_type_overrides`.
     #[cfg(feature = "regex_path")]
     pub json_regex_type_overrides: Vec<(Regex, JsonArray)>,
-
-    /// Custom functionality to filter namespaces
-    pub ignored_namespaces: Vec<String>,
+    pub ignored_namespace_uris: Vec<String>,  // Changed from ignored_namespaces
 }
 
 impl Config {
-    /// Numbers with leading zero will be treated as numbers.
-    /// Prefix XML Attribute names with `@`
-    /// Name XML text nodes `#text` for XML Elements with other children
     pub fn new_with_defaults() -> Self {
         Config {
             leading_zero_as_string: false,
@@ -165,28 +137,28 @@ impl Config {
             json_type_overrides: HashMap::new(),
             #[cfg(feature = "regex_path")]
             json_regex_type_overrides: Vec::new(),
-            ignored_namespaces: Vec::new(),
+            ignored_namespace_uris: Vec::new(),  // Changed from ignored_namespaces
         }
     }
 
-    /// Create a Config object with non-default values. See the `Config` struct docs for more info.
-   pub fn new_with_custom_values(
-    leading_zero_as_string: bool,
-    xml_attr_prefix: &str,
-    xml_text_node_prop_name: &str,
-    empty_element_handling: NullValue,
-    ignored_namespaces: Vec<String>,
-) -> Self {
-    Config {
-        leading_zero_as_string,
-        xml_attr_prefix: xml_attr_prefix.to_owned(),
-        xml_text_node_prop_name: xml_text_node_prop_name.to_owned(),
-        empty_element_handling,
-        #[cfg(feature = "json_types")]
-        json_type_overrides: HashMap::new(),
-        #[cfg(feature = "regex_path")]
-        json_regex_type_overrides: Vec::new(),
-        ignored_namespaces, // Use the parameter here
+    pub fn new_with_custom_values(
+        leading_zero_as_string: bool,
+        xml_attr_prefix: &str,
+        xml_text_node_prop_name: &str,
+        empty_element_handling: NullValue,
+        ignored_namespace_uris: Vec<String>,  // Changed parameter name
+    ) -> Self {
+        Config {
+            leading_zero_as_string,
+            xml_attr_prefix: xml_attr_prefix.to_owned(),
+            xml_text_node_prop_name: xml_text_node_prop_name.to_owned(),
+            empty_element_handling,
+            #[cfg(feature = "json_types")]
+            json_type_overrides: HashMap::new(),
+            #[cfg(feature = "regex_path")]
+            json_regex_type_overrides: Vec::new(),
+            ignored_namespace_uris,  // Changed field name
+        }
     }
 }
 
@@ -283,8 +255,8 @@ fn parse_text(text: &str, leading_zero_as_string: bool, json_type: &JsonType) ->
 /// Converts an XML Element into a JSON property
 fn convert_node(el: &Element, config: &Config, path: &String) -> Option<Value> {
     // Check if this element's namespace should be ignored
-    if let Some(prefix) = el.prefix() {
-        if config.ignored_namespaces.contains(&prefix.to_string()) {
+    if let Some(ns) = el.ns() {
+        if config.ignored_namespace_uris.contains(&ns.to_string()) {
             let mut combined_content = Map::new();
 
             // Process attributes first (even for ignored namespaces)
@@ -344,23 +316,24 @@ fn convert_node(el: &Element, config: &Config, path: &String) -> Option<Value> {
         }
     }
 
-    // Build path for this node
+    // Rest of the existing convert_node implementation...
     #[cfg(feature = "json_types")]
     let current_path = format!("{}/{}", path, el.name());
     #[cfg(not(feature = "json_types"))]
     let current_path = String::new();
 
-    // Get JSON type for this node
     let (is_array, json_type_value) = get_json_type(config, &current_path);
 
     let mut data = Map::new();
 
-    // Add namespace URI as attribute if present
+    // Add namespace URI as attribute if present and not ignored
     if let Some(ns) = el.ns() {
-        data.insert(
-            format!("{}xmlns", config.xml_attr_prefix),
-            Value::String(ns.to_string()),
-        );
+        if !config.ignored_namespace_uris.contains(&ns.to_string()) {
+            data.insert(
+                format!("{}xmlns", config.xml_attr_prefix),
+                Value::String(ns.to_string()),
+            );
+        }
     }
 
     // Process attributes
@@ -437,16 +410,13 @@ fn convert_node(el: &Element, config: &Config, path: &String) -> Option<Value> {
     }
 }
 
-// Update the xml_to_map function
 fn xml_to_map(e: &Element, config: &Config) -> Value {
     let mut data = Map::new();
     let root_name = e.name().to_string();
-    use std::collections::HashMap;
 
-
-    // Check root namespace exclusion
+    // Check root namespace exclusion by URI
     if let Some(ns) = e.ns() {
-        if config.ignored_namespaces.contains(&ns.to_string()) {
+        if config.ignored_namespace_uris.contains(&ns.to_string()) {
             return Value::Null;
         }
     }
@@ -455,7 +425,7 @@ fn xml_to_map(e: &Element, config: &Config) -> Value {
     let namespaces: HashMap<String, String> = e
         .namespace_declarations()
         .into_iter()
-        .filter(|(_, uri)| !config.ignored_namespaces.contains(uri))
+        .filter(|(_, uri)| !config.ignored_namespace_uris.contains(uri))
         .collect();
 
     let namespace_count = namespaces.len();
@@ -465,7 +435,7 @@ fn xml_to_map(e: &Element, config: &Config) -> Value {
 
     // Add root namespace if present and not excluded
     if let Some(ns) = e.ns() {
-        if !config.ignored_namespaces.contains(&ns.to_string()) {
+        if !config.ignored_namespace_uris.contains(&ns.to_string()) {
             root_content.insert(
                 format!("{}xmlns", config.xml_attr_prefix),
                 Value::String(ns.to_string()),
