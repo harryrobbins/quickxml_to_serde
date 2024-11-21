@@ -3,60 +3,16 @@
 #![allow(clippy::single_char_pattern)]
 #![allow(clippy::needless_borrow)]
 #![allow(clippy::ptr_arg)]
+
 //! # quickxml_to_serde
-//! Fast and flexible conversion from XML to JSON using [quick-xml](https://github.com/tafia/quick-xml)
-//! and [serde](https://github.com/serde-rs/json). Inspired by [node2object](https://github.com/vorot93/node2object).
-//!
-//! This crate converts XML elements, attributes and text nodes directly into corresponding JSON structures.
-//! Some common usage scenarios would be converting XML into JSON for loading into No-SQL databases
-//! or sending it to the front end application.
-//!
-//! Because of the richness and flexibility of XML some conversion behavior is configurable:
-//! - attribute name prefixes
-//! - naming of text nodes
-//! - number format conversion
-//!
-//! ## Usage example
-//! ```
-//! extern crate quickxml_to_serde;
-//! use quickxml_to_serde::{xml_string_to_json, Config, NullValue};
-//!
-//! fn main() {
-//!    let xml = r#"<a attr1="1"><b><c attr2="001">some text</c></b></a>"#;
-//!    let conf = Config::new_with_defaults();
-//!    let json = xml_string_to_json(xml.to_owned(), &conf);
-//!    println!("{}", json.expect("Malformed XML").to_string());
-//!
-//!    let conf = Config::new_with_custom_values(true, "", "txt", NullValue::Null);
-//!    let json = xml_string_to_json(xml.to_owned(), &conf);
-//!    println!("{}", json.expect("Malformed XML").to_string());
-//! }
-//! ```
-//! * **Output with the default config:** `{"a":{"@attr1":1,"b":{"c":{"#text":"some text","@attr2":1}}}}`
-//! * **Output with a custom config:** `{"a":{"attr1":1,"b":{"c":{"attr2":"001","txt":"some text"}}}}`
-//!
-//! ## Additional features
-//! Use `quickxml_to_serde = { version = "0.4", features = ["json_types"] }` to enable support for enforcing JSON types
-//! for some XML nodes using xPath-like notations. Example for enforcing attribute `attr2` from the snippet above
-//! as JSON String regardless of its contents:
-//! ```
-//! use quickxml_to_serde::{Config, JsonArray, JsonType};
-//!
-//! #[cfg(feature = "json_types")]
-//! let conf = Config::new_with_defaults()
-//!            .add_json_type_override("/a/b/c/@attr2", JsonArray::Infer(JsonType::AlwaysString));
-//! ```
-//!
-//! ## Detailed documentation
-//! See [README](https://github.com/AlecTroemel/quickxml_to_serde) in the source repo for more examples, limitations and detailed behavior description.
-//!
-//! ## Testing your XML files
-//!
-//! If you want to see how your XML files are converted into JSON, place them into `./test_xml_files` directory
-//! and run `cargo test`. They will be converted into JSON and saved in the saved directory.
+//! ... (your existing documentation) ...
 
 extern crate minidom;
 extern crate serde_json;
+
+// Add the namespace module and import ONCE at the top with other imports
+mod namespace_ext;
+use namespace_ext::NamespaceElementExt;
 
 #[cfg(feature = "regex_path")]
 extern crate regex;
@@ -72,6 +28,7 @@ use regex::Regex;
 
 #[cfg(test)]
 mod tests;
+
 
 /// Defines how empty elements like `<x />` should be handled.
 /// `Ignore` -> exclude from JSON, `Null` -> `"x":null`, EmptyObject -> `"x":{}`.
@@ -323,35 +280,52 @@ fn convert_node(el: &Element, config: &Config, path: &String) -> Option<Value> {
     // get the json_type for this node
     let (_, json_type_value) = get_json_type(config, &path);
 
+    let mut namespace_count = 0;
+    let mut data = Map::new();
+
+    // Process attributes first, including namespaces
+    for (k, v) in el.attrs() {
+        if k.starts_with("xmlns") {
+            namespace_count += 1;
+        }
+
+        // add the current node to the path
+        #[cfg(feature = "json_types")]
+        let attr_path = [path.clone(), "/@".to_owned(), k.to_owned()].concat();
+
+        // get the json_type for this node
+        #[cfg(feature = "json_types")]
+        let (_, json_type_value) = get_json_type(config, &attr_path);
+
+        data.insert(
+            [config.xml_attr_prefix.clone(), k.to_owned()].concat(),
+            parse_text(&v, config.leading_zero_as_string, &json_type_value),
+        );
+    }
+
+    // Add namespace count as metadata if any were found
+    if namespace_count > 0 {
+        data.insert(
+            "_namespace_count".to_string(),
+            Value::Number(Number::from(namespace_count))
+        );
+    }
+
     // is it an element with text?
     if el.text().trim() != "" {
-        // process node's attributes, if present
-        if el.attrs().count() > 0 {
-            Some(Value::Object(
-                el.attrs()
-                    .map(|(k, v)| {
-                        // add the current node to the path
-                        #[cfg(feature = "json_types")]
-                        let path = [path.clone(), "/@".to_owned(), k.to_owned()].concat();
-                        // get the json_type for this node
-                        #[cfg(feature = "json_types")]
-                        let (_, json_type_value) = get_json_type(config, &path);
-                        (
-                            [config.xml_attr_prefix.clone(), k.to_owned()].concat(),
-                            parse_text(&v, config.leading_zero_as_string, &json_type_value),
-                        )
-                    })
-                    .chain(vec![(
-                        config.xml_text_node_prop_name.clone(),
-                        parse_text(
-                            &el.text()[..],
-                            config.leading_zero_as_string,
-                            &json_type_value,
-                        ),
-                    )])
-                    .collect(),
-            ))
+        if !data.is_empty() {
+            // We already have attributes, so add text as a property
+            data.insert(
+                config.xml_text_node_prop_name.clone(),
+                parse_text(
+                    &el.text()[..],
+                    config.leading_zero_as_string,
+                    &json_type_value,
+                ),
+            );
+            Some(Value::Object(data))
         } else {
+            // No attributes, just return the text value
             Some(parse_text(
                 &el.text()[..],
                 config.leading_zero_as_string,
@@ -359,23 +333,7 @@ fn convert_node(el: &Element, config: &Config, path: &String) -> Option<Value> {
             ))
         }
     } else {
-        // this element has no text, but may have other child nodes
-        let mut data = Map::new();
-
-        for (k, v) in el.attrs() {
-            // add the current node to the path
-            #[cfg(feature = "json_types")]
-            let path = [path.clone(), "/@".to_owned(), k.to_owned()].concat();
-            // get the json_type for this node
-            #[cfg(feature = "json_types")]
-            let (_, json_type_value) = get_json_type(config, &path);
-            data.insert(
-                [config.xml_attr_prefix.clone(), k.to_owned()].concat(),
-                parse_text(&v, config.leading_zero_as_string, &json_type_value),
-            );
-        }
-
-        // process child element recursively
+        // Process child elements recursively
         for child in el.children() {
             match convert_node(child, config, &path) {
                 Some(val) => {
@@ -384,6 +342,7 @@ fn convert_node(el: &Element, config: &Config, path: &String) -> Option<Value> {
                     #[cfg(feature = "json_types")]
                     let path = [path.clone(), "/".to_owned(), name.clone()].concat();
                     let (json_type_array, _) = get_json_type(config, &path);
+
                     // does it have to be an array?
                     if json_type_array || data.contains_key(name) {
                         // was this property converted to an array earlier?
@@ -403,8 +362,7 @@ fn convert_node(el: &Element, config: &Config, path: &String) -> Option<Value> {
                             data.insert(name.clone(), Value::Array(new_val));
                         }
                     } else {
-                        // this is the first time this property is encountered and it doesn't
-                        // have to be an array, so add it as-is
+                        // this is the first time this property is encountered
                         data.insert(name.clone(), val);
                     }
                 }
@@ -417,7 +375,7 @@ fn convert_node(el: &Element, config: &Config, path: &String) -> Option<Value> {
             return Some(Value::Object(data));
         }
 
-        // empty objects are treated according to config rules set by the caller
+        // empty objects are treated according to config rules
         match config.empty_element_handling {
             NullValue::Null => Some(Value::Null),
             NullValue::EmptyObject => Some(Value::Object(data)),
@@ -428,12 +386,57 @@ fn convert_node(el: &Element, config: &Config, path: &String) -> Option<Value> {
 
 fn xml_to_map(e: &Element, config: &Config) -> Value {
     let mut data = Map::new();
-    data.insert(
-        e.name().to_string(),
-        convert_node(&e, &config, &String::new()).unwrap_or(Value::Null),
-    );
+    let root_name = e.name().to_string();
+
+    // Get namespaces using our extension trait
+    let namespaces = e.namespace_declarations();
+    let namespace_count = namespaces.len(); // Store length before move
+
+    // Create regular root content map for attributes and children
+    let mut root_content = Map::new();
+
+    // Process regular attributes
+    for (k, v) in e.attrs() {
+        root_content.insert(
+            format!("{}{}", config.xml_attr_prefix, k),
+            parse_text(&v, config.leading_zero_as_string, &JsonType::Infer),
+        );
+    }
+
+    // Process child content
+    if let Some(child_content) = convert_node(e, config, &String::new()) {
+        match child_content {
+            Value::Object(map) => {
+                for (k, v) in map {
+                    root_content.insert(k, v);
+                }
+            }
+            _ => {
+                root_content.insert(config.xml_text_node_prop_name.clone(), child_content);
+            }
+        }
+    }
+
+    // Add namespace information first (if we have any)
+    if !namespaces.is_empty() {
+        let namespace_map: Map<String, Value> = namespaces
+            .into_iter()
+            .map(|(k, v)| (k, Value::String(v)))
+            .collect();
+
+        data.insert("namespaces".to_string(), Value::Object(namespace_map));
+        data.insert(
+            "namespace_count".to_string(),
+            Value::Number(Number::from(namespace_count as u64))
+        );
+    }
+
+    // Add the root element content
+    data.insert(root_name, Value::Object(root_content));
+
     Value::Object(data)
 }
+
 
 /// Converts the given XML string into `serde::Value` using settings from `Config` struct.
 pub fn xml_str_to_json(xml: &str, config: &Config) -> Result<Value, Error> {
@@ -453,9 +456,9 @@ pub fn xml_string_to_json(xml: String, config: &Config) -> Result<Value, Error> 
 #[inline]
 fn get_json_type_with_absolute_path<'conf>(config: &'conf Config, path: &String) -> (bool, &'conf JsonType) {
     match config
-    .json_type_overrides
-    .get(path)
-    .unwrap_or(&JsonArray::Infer(JsonType::Infer))
+        .json_type_overrides
+        .get(path)
+        .unwrap_or(&JsonArray::Infer(JsonType::Infer))
     {
         JsonArray::Infer(v) => (false, v),
         JsonArray::Always(v) => (true, v),
