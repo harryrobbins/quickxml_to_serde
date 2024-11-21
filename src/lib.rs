@@ -4,9 +4,6 @@
 #![allow(clippy::needless_borrow)]
 #![allow(clippy::ptr_arg)]
 
-//! # quickxml_to_serde
-//! ... (your existing documentation) ...
-
 extern crate minidom;
 extern crate serde_json;
 
@@ -20,7 +17,7 @@ extern crate regex;
 use minidom::{Element, Error};
 use serde_json::{Map, Number, Value};
 #[cfg(feature = "json_types")]
-use std::collections::HashMap;
+use std::collections::HashMap;  // And this line for the non-feature case
 use std::str::FromStr;
 
 #[cfg(feature = "regex_path")]
@@ -35,12 +32,14 @@ mod tests;
 /// `EmptyObject` is the default option and is how it was handled prior to v.0.4
 /// Using `Ignore` on an XML document with an empty root element falls back to `Null` option.
 /// E.g. both `<a><x/></a>` and `<a/>` are converted into `{"a":null}`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum NullValue {
     Ignore,
     Null,
     EmptyObject,
 }
+
+
 
 /// Defines how the values of this Node should be converted into a JSON array with the underlying types.
 /// * `Infer` - the nodes are converted into a JSON array only if there are multiple identical elements.
@@ -49,7 +48,7 @@ pub enum NullValue {
 /// * `Always` - the nodes are converted into a JSON array regardless of how many there are.
 /// E.g. `<a><b>1</b></a>` becomes an array with a single value `{"a": {"b": [1] }}` and
 /// `<a><b>1</b><b>2</b><b>3</b></a>` also becomes an array `{"a": {"b": [1, 2, 3] }}`
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum JsonArray {
     /// Convert the nodes into a JSON array even if there is only one element
     Always(JsonType),
@@ -114,7 +113,7 @@ pub enum JsonType {
 
 /// Tells the converter how to perform certain conversions.
 /// See docs for individual fields for more info.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
     /// Numeric values starting with 0 will be treated as strings.
     /// E.g. convert `<agent>007</agent>` into `"agent":"007"` or `"agent":7`
@@ -149,7 +148,7 @@ pub struct Config {
     pub json_regex_type_overrides: Vec<(Regex, JsonArray)>,
 
     /// Custom functionality to filter namespaces
-    pub excluded_namespaces: Vec<String>
+    pub ignored_namespaces: Vec<String>,
 }
 
 impl Config {
@@ -166,30 +165,31 @@ impl Config {
             json_type_overrides: HashMap::new(),
             #[cfg(feature = "regex_path")]
             json_regex_type_overrides: Vec::new(),
-            excluded_namespaces: Vec::new(),
+            ignored_namespaces: Vec::new(),
         }
     }
 
     /// Create a Config object with non-default values. See the `Config` struct docs for more info.
-    pub fn new_with_custom_values(
-        leading_zero_as_string: bool,
-        xml_attr_prefix: &str,
-        xml_text_node_prop_name: &str,
-        empty_element_handling: NullValue,
-        excluded_namespaces: Vec<String>,
-    ) -> Self {
-        Config {
-            leading_zero_as_string,
-            xml_attr_prefix: xml_attr_prefix.to_owned(),
-            xml_text_node_prop_name: xml_text_node_prop_name.to_owned(),
-            empty_element_handling,
-            #[cfg(feature = "json_types")]
-            json_type_overrides: HashMap::new(),
-            #[cfg(feature = "regex_path")]
-            json_regex_type_overrides: Vec::new(),
-            excluded_namespaces,
-        }
+   pub fn new_with_custom_values(
+    leading_zero_as_string: bool,
+    xml_attr_prefix: &str,
+    xml_text_node_prop_name: &str,
+    empty_element_handling: NullValue,
+    ignored_namespaces: Vec<String>,
+) -> Self {
+    Config {
+        leading_zero_as_string,
+        xml_attr_prefix: xml_attr_prefix.to_owned(),
+        xml_text_node_prop_name: xml_text_node_prop_name.to_owned(),
+        empty_element_handling,
+        #[cfg(feature = "json_types")]
+        json_type_overrides: HashMap::new(),
+        #[cfg(feature = "regex_path")]
+        json_regex_type_overrides: Vec::new(),
+        ignored_namespaces, // Use the parameter here
     }
+}
+
 
     /// Adds a single JSON Type override rule to the current config.
     /// # Example
@@ -278,20 +278,80 @@ fn parse_text(text: &str, leading_zero_as_string: bool, json_type: &JsonType) ->
 }
 
 /// Converts an XML Element into a JSON property
+
+// Update the convert_node function
+/// Converts an XML Element into a JSON property
 fn convert_node(el: &Element, config: &Config, path: &String) -> Option<Value> {
-    // Check if element's namespace should be excluded
-    if let Some(ns) = el.ns() {
-        if config.excluded_namespaces.contains(&ns.to_string()) {
-            return None;
+    // Check if this element's namespace should be ignored
+    if let Some(prefix) = el.prefix() {
+        if config.ignored_namespaces.contains(&prefix.to_string()) {
+            let mut combined_content = Map::new();
+
+            // Process attributes first (even for ignored namespaces)
+            for (k, v) in el.attrs() {
+                if !k.starts_with("xmlns") {
+                    combined_content.insert(
+                        format!("{}{}", config.xml_attr_prefix, k),
+                        parse_text(&v, config.leading_zero_as_string, &JsonType::Infer),
+                    );
+                }
+            }
+
+            // Process child elements recursively
+            for child in el.children() {
+                if let Some(child_value) = convert_node(child, config, path) {
+                    let child_name = child.name().to_string();
+
+                    match combined_content.get_mut(&child_name) {
+                        Some(existing) => {
+                            // Convert to array if not already
+                            if !existing.is_array() {
+                                let temp = existing.clone();
+                                *existing = Value::Array(vec![temp]);
+                            }
+
+                            // Add new value to array
+                            if let Some(arr) = existing.as_array_mut() {
+                                arr.push(child_value);
+                            }
+                        },
+                        None => {
+                            combined_content.insert(child_name, child_value);
+                        }
+                    }
+                }
+            }
+
+            // Handle text content if present
+            let element_text = el.text();
+            let text = element_text.trim();
+            if !text.is_empty() {
+                combined_content.insert(
+                    config.xml_text_node_prop_name.clone(),
+                    parse_text(text, config.leading_zero_as_string, &JsonType::Infer),
+                );
+            }
+
+            return if !combined_content.is_empty() {
+                Some(Value::Object(combined_content))
+            } else {
+                match config.empty_element_handling {
+                    NullValue::Null => Some(Value::Null),
+                    NullValue::EmptyObject => Some(Value::Object(Map::new())),
+                    NullValue::Ignore => None,
+                }
+            };
         }
     }
 
-    // add the current node to the path
+    // Build path for this node
     #[cfg(feature = "json_types")]
-    let path = [path, "/", el.name()].concat();
+    let current_path = format!("{}/{}", path, el.name());
+    #[cfg(not(feature = "json_types"))]
+    let current_path = String::new();
 
-    // get the json_type for this node
-    let (_, json_type_value) = get_json_type(config, &path);
+    // Get JSON type for this node
+    let (is_array, json_type_value) = get_json_type(config, &current_path);
 
     let mut data = Map::new();
 
@@ -303,108 +363,90 @@ fn convert_node(el: &Element, config: &Config, path: &String) -> Option<Value> {
         );
     }
 
-    // Process attributes first, including namespaces
+    // Process attributes
     for (k, v) in el.attrs() {
-        // Skip xmlns attributes as we handle them separately now
-        if k.starts_with("xmlns") {
-            continue;
+        if !k.starts_with("xmlns") {
+            #[cfg(feature = "json_types")]
+            let attr_path = format!("{}/@{}", current_path, k);
+            #[cfg(not(feature = "json_types"))]
+            let attr_path = String::new();
+
+            let (_, attr_json_type) = get_json_type(config, &attr_path);
+
+            data.insert(
+                format!("{}{}", config.xml_attr_prefix, k),
+                parse_text(v, config.leading_zero_as_string, attr_json_type),
+            );
         }
-
-        // add the current node to the path
-        #[cfg(feature = "json_types")]
-        let attr_path = [path.clone(), "/@".to_owned(), k.to_owned()].concat();
-
-        // get the json_type for this node
-        #[cfg(feature = "json_types")]
-        let (_, json_type_value) = get_json_type(config, &attr_path);
-
-        data.insert(
-            [config.xml_attr_prefix.clone(), k.to_owned()].concat(),
-            parse_text(&v, config.leading_zero_as_string, &json_type_value),
-        );
     }
 
-
-    // is it an element with text?
-    if el.text().trim() != "" {
+    // Handle text content
+    let element_text = el.text();
+    let text = element_text.trim();
+    if !text.is_empty() {
         if !data.is_empty() {
-            // We already have attributes, so add text as a property
             data.insert(
                 config.xml_text_node_prop_name.clone(),
-                parse_text(
-                    &el.text()[..],
-                    config.leading_zero_as_string,
-                    &json_type_value,
-                ),
+                parse_text(text, config.leading_zero_as_string, json_type_value),
             );
             Some(Value::Object(data))
         } else {
-            // No attributes, just return the text value
-            Some(parse_text(
-                &el.text()[..],
-                config.leading_zero_as_string,
-                &json_type_value,
-            ))
+            Some(parse_text(text, config.leading_zero_as_string, json_type_value))
         }
     } else {
-        // Process child elements recursively
+        // Process child elements
         for child in el.children() {
-            match convert_node(child, config, &path) {
-                Some(val) => {
-                    let name = &child.name().to_string();
+            if let Some(child_value) = convert_node(child, config, &current_path) {
+                let child_name = child.name().to_string();
 
-                    #[cfg(feature = "json_types")]
-                    let path = [path.clone(), "/".to_owned(), name.clone()].concat();
-                    let (json_type_array, _) = get_json_type(config, &path);
+                #[cfg(feature = "json_types")]
+                let child_path = format!("{}/{}", current_path, child_name);
+                #[cfg(not(feature = "json_types"))]
+                let child_path = String::new();
 
-                    // does it have to be an array?
-                    if json_type_array || data.contains_key(name) {
-                        // was this property converted to an array earlier?
-                        if data.get(name).unwrap_or(&Value::Null).is_array() {
-                            // add the new value to an existing array
-                            data.get_mut(name)
-                                .unwrap()
-                                .as_array_mut()
-                                .unwrap()
-                                .push(val);
-                        } else {
-                            // convert the property to an array with the existing and the new values
-                            let new_val = match data.remove(name) {
-                                None => vec![val],
-                                Some(temp) => vec![temp, val],
-                            };
-                            data.insert(name.clone(), Value::Array(new_val));
+                let (child_is_array, _) = get_json_type(config, &child_path);
+
+                if child_is_array || is_array || data.contains_key(&child_name) {
+                    match data.get_mut(&child_name) {
+                        Some(existing) if existing.is_array() => {
+                            existing.as_array_mut().unwrap().push(child_value);
+                        },
+                        Some(existing) => {
+                            let temp = existing.clone();
+                            data.insert(child_name, Value::Array(vec![temp, child_value]));
+                        },
+                        None => {
+                            data.insert(child_name, Value::Array(vec![child_value]));
                         }
-                    } else {
-                        // this is the first time this property is encountered
-                        data.insert(name.clone(), val);
                     }
+                } else {
+                    data.insert(child_name, child_value);
                 }
-                _ => (),
             }
         }
 
-        // return the JSON object if it's not empty
         if !data.is_empty() {
-            return Some(Value::Object(data));
-        }
-
-        // empty objects are treated according to config rules
-        match config.empty_element_handling {
-            NullValue::Null => Some(Value::Null),
-            NullValue::EmptyObject => Some(Value::Object(data)),
-            NullValue::Ignore => None,
+            Some(Value::Object(data))
+        } else {
+            match config.empty_element_handling {
+                NullValue::Null => Some(Value::Null),
+                NullValue::EmptyObject => Some(Value::Object(data)),
+                NullValue::Ignore => None,
+            }
         }
     }
 }
 
+// Update the xml_to_map function
 fn xml_to_map(e: &Element, config: &Config) -> Value {
     let mut data = Map::new();
     let root_name = e.name().to_string();
+    use std::collections::HashMap;
+
 
     // Check root namespace exclusion
     if let Some(ns) = e.ns() {
-        if config.excluded_namespaces.contains(&ns.to_string()) {
+        if config.ignored_namespaces.contains(&ns.to_string()) {
             return Value::Null;
         }
     }
@@ -413,7 +455,7 @@ fn xml_to_map(e: &Element, config: &Config) -> Value {
     let namespaces: HashMap<String, String> = e
         .namespace_declarations()
         .into_iter()
-        .filter(|(_, uri)| !config.excluded_namespaces.contains(uri))
+        .filter(|(_, uri)| !config.ignored_namespaces.contains(uri))
         .collect();
 
     let namespace_count = namespaces.len();
@@ -423,22 +465,22 @@ fn xml_to_map(e: &Element, config: &Config) -> Value {
 
     // Add root namespace if present and not excluded
     if let Some(ns) = e.ns() {
-        if !config.excluded_namespaces.contains(&ns.to_string()) {
+        if !config.ignored_namespaces.contains(&ns.to_string()) {
             root_content.insert(
                 format!("{}xmlns", config.xml_attr_prefix),
                 Value::String(ns.to_string()),
             );
         }
     }
-    // Create regular root content map for attributes and children
-    let mut root_content = Map::new();
 
     // Process regular attributes
     for (k, v) in e.attrs() {
-        root_content.insert(
-            format!("{}{}", config.xml_attr_prefix, k),
-            parse_text(&v, config.leading_zero_as_string, &JsonType::Infer),
-        );
+        if !k.starts_with("xmlns") {
+            root_content.insert(
+                format!("{}{}", config.xml_attr_prefix, k),
+                parse_text(&v, config.leading_zero_as_string, &JsonType::Infer),
+            );
+        }
     }
 
     // Process child content
@@ -457,12 +499,7 @@ fn xml_to_map(e: &Element, config: &Config) -> Value {
 
     // Add namespace information first (if we have any)
     if !namespaces.is_empty() {
-        let namespace_map: Map<String, Value> = namespaces
-            .into_iter()
-            .map(|(k, v)| (k, Value::String(v)))
-            .collect();
-
-        data.insert("namespaces".to_string(), Value::Object(namespace_map));
+        data.insert("namespaces".to_string(), Value::Object(namespaces.into_iter().map(|(k, v)| (k, Value::String(v))).collect()));
         data.insert(
             "namespace_count".to_string(),
             Value::Number(Number::from(namespace_count as u64))
