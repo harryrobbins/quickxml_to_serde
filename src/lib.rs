@@ -147,6 +147,9 @@ pub struct Config {
     /// property and the `json_type_overrides` property. The path syntax is based on xPath just like `json_type_overrides`.
     #[cfg(feature = "regex_path")]
     pub json_regex_type_overrides: Vec<(Regex, JsonArray)>,
+
+    /// Custom functionality to filter namespaces
+    pub excluded_namespaces: Vec<String>
 }
 
 impl Config {
@@ -163,6 +166,7 @@ impl Config {
             json_type_overrides: HashMap::new(),
             #[cfg(feature = "regex_path")]
             json_regex_type_overrides: Vec::new(),
+            excluded_namespaces: Vec::new(),
         }
     }
 
@@ -172,6 +176,7 @@ impl Config {
         xml_attr_prefix: &str,
         xml_text_node_prop_name: &str,
         empty_element_handling: NullValue,
+        excluded_namespaces: Vec<String>,
     ) -> Self {
         Config {
             leading_zero_as_string,
@@ -182,6 +187,7 @@ impl Config {
             json_type_overrides: HashMap::new(),
             #[cfg(feature = "regex_path")]
             json_regex_type_overrides: Vec::new(),
+            excluded_namespaces,
         }
     }
 
@@ -273,6 +279,13 @@ fn parse_text(text: &str, leading_zero_as_string: bool, json_type: &JsonType) ->
 
 /// Converts an XML Element into a JSON property
 fn convert_node(el: &Element, config: &Config, path: &String) -> Option<Value> {
+    // Check if element's namespace should be excluded
+    if let Some(ns) = el.ns() {
+        if config.excluded_namespaces.contains(&ns.to_string()) {
+            return None;
+        }
+    }
+
     // add the current node to the path
     #[cfg(feature = "json_types")]
     let path = [path, "/", el.name()].concat();
@@ -280,13 +293,21 @@ fn convert_node(el: &Element, config: &Config, path: &String) -> Option<Value> {
     // get the json_type for this node
     let (_, json_type_value) = get_json_type(config, &path);
 
-    let mut namespace_count = 0;
     let mut data = Map::new();
+
+    // Add namespace URI as attribute if present
+    if let Some(ns) = el.ns() {
+        data.insert(
+            format!("{}xmlns", config.xml_attr_prefix),
+            Value::String(ns.to_string()),
+        );
+    }
 
     // Process attributes first, including namespaces
     for (k, v) in el.attrs() {
+        // Skip xmlns attributes as we handle them separately now
         if k.starts_with("xmlns") {
-            namespace_count += 1;
+            continue;
         }
 
         // add the current node to the path
@@ -303,13 +324,6 @@ fn convert_node(el: &Element, config: &Config, path: &String) -> Option<Value> {
         );
     }
 
-    // Add namespace count as metadata if any were found
-    if namespace_count > 0 {
-        data.insert(
-            "_namespace_count".to_string(),
-            Value::Number(Number::from(namespace_count))
-        );
-    }
 
     // is it an element with text?
     if el.text().trim() != "" {
@@ -388,10 +402,34 @@ fn xml_to_map(e: &Element, config: &Config) -> Value {
     let mut data = Map::new();
     let root_name = e.name().to_string();
 
-    // Get namespaces using our extension trait
-    let namespaces = e.namespace_declarations();
-    let namespace_count = namespaces.len(); // Store length before move
+    // Check root namespace exclusion
+    if let Some(ns) = e.ns() {
+        if config.excluded_namespaces.contains(&ns.to_string()) {
+            return Value::Null;
+        }
+    }
 
+    // Get namespaces using our extension trait
+    let namespaces: HashMap<String, String> = e
+        .namespace_declarations()
+        .into_iter()
+        .filter(|(_, uri)| !config.excluded_namespaces.contains(uri))
+        .collect();
+
+    let namespace_count = namespaces.len();
+
+    // Create regular root content map for attributes and children
+    let mut root_content = Map::new();
+
+    // Add root namespace if present and not excluded
+    if let Some(ns) = e.ns() {
+        if !config.excluded_namespaces.contains(&ns.to_string()) {
+            root_content.insert(
+                format!("{}xmlns", config.xml_attr_prefix),
+                Value::String(ns.to_string()),
+            );
+        }
+    }
     // Create regular root content map for attributes and children
     let mut root_content = Map::new();
 
